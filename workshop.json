@@ -1,0 +1,22 @@
+{
+    "workshop": {
+        "schema": {
+            "version": "2020.03.02"
+        }
+    },
+    "userenvs": [
+        {
+            "name": "default",
+            "requirements": [ "dpdk_deps" ]
+        }
+    ],
+    "requirements": [
+        {
+            "name": "dpdk_deps",
+            "type": "distro",
+            "distro_info": {
+                "packages": [ "python3", "xz" ]
+            }
+        }
+    ]
+}

@@ -1,0 +1,32 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+TOOL_OUTPUT_DIR=$(pwd)
+
+PID_FILE="${TOOL_OUTPUT_DIR}/dpdk-collect-pid.txt"
+
+if [ -f "${PID_FILE}" ]; then
+    COLLECTOR_PID=$(cat "${PID_FILE}")
+    if kill -0 "${COLLECTOR_PID}" 2>/dev/null; then
+        kill -SIGTERM "${COLLECTOR_PID}"
+        for i in $(seq 1 10); do
+            if ! kill -0 "${COLLECTOR_PID}" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if kill -0 "${COLLECTOR_PID}" 2>/dev/null; then
+            kill -9 "${COLLECTOR_PID}"
+        fi
+    fi
+    rm -f "${PID_FILE}"
+fi
+
+for f in "${TOOL_OUTPUT_DIR}"/dpdk-telemetry-*.json; do
+    if [ -f "$f" ]; then
+        xz --threads=0 "$f"
+    fi
+done
+
+echo "tool-dpdk: collection stopped, output compressed"

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# -*- mode: python; indent-tabs-mode: nil; python-indent-level: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
+"""
+tool-dpdk post-processor: reads collected telemetry JSON, computes deltas,
+and emits CDM-compliant metrics via the toolbox.metrics API.
+"""
+
+import json
+import lzma
+import os
+import sys
+from pathlib import Path
+
+TOOLBOX_HOME = os.environ.get("TOOLBOX_HOME")
+if TOOLBOX_HOME:
+    sys.path.append(str(Path(TOOLBOX_HOME) / "python"))
+
+from toolbox.metrics import log_sample, finish_samples
+
+
+def process(output_dir):
+    compressed = os.path.join(output_dir, "dpdk-telemetry-output.json.xz")
+    if not os.path.exists(compressed):
+        sys.stderr.write(f"tool-dpdk: {compressed} not found, skipping\n")
+        return
+
+    with lzma.open(compressed, "rt") as f:
+        lines = f.readlines()
+
+    if not lines:
+        return
+
+    header = json.loads(lines[0]).get("header", {})
+    samples = [json.loads(line) for line in lines[1:] if line.strip()]
+
+    file_id = "0"
+
+    for sample in samples:
+        ts = sample.get("timestamp_ms")
+        data = sample.get("data", {})
+
+        for key, port_data in data.items():
+            if not key.startswith("port_"):
+                continue
+            port_id = key.replace("port_", "")
+
+            stats = port_data.get("/ethdev/stats", {})
+            for metric_name, cdm_class, cdm_type in [
+                ("ipackets", "throughput", "rx-packets"),
+                ("opackets", "throughput", "tx-packets"),
+                ("ibytes", "throughput", "rx-bytes"),
+                ("obytes", "throughput", "tx-bytes"),
+                ("imissed", "count", "rx-missed"),
+                ("ierrors", "count", "rx-errors"),
+                ("oerrors", "count", "tx-errors"),
+                ("rx_nombuf", "count", "rx-nombuf"),
+            ]:
+                value = stats.get(metric_name)
+                if value is not None:
+                    desc = {
+                        "source": "dpdk",
+                        "class": cdm_class,
+                        "type": cdm_type,
+                    }
+                    names = {"port": port_id}
+                    log_sample(file_id, desc, names, {"end": ts, "value": value})
+
+            for q_metric, cdm_type in [
+                ("q_ipackets", "rx-queue-packets"),
+                ("q_opackets", "tx-queue-packets"),
+            ]:
+                q_values = stats.get(q_metric, [])
+                for queue_id, value in enumerate(q_values):
+                    if value and value != 0:
+                        desc = {
+                            "source": "dpdk",
+                            "class": "throughput",
+                            "type": cdm_type,
+                        }
+                        names = {"port": port_id, "queue": str(queue_id)}
+                        log_sample(
+                            file_id, desc, names, {"end": ts, "value": value}
+                        )
+
+            xstats = port_data.get("/ethdev/xstats", {})
+            for xstat_name, xstat_value in xstats.items():
+                if isinstance(xstat_value, (int, float)) and xstat_value != 0:
+                    desc = {
+                        "source": "dpdk",
+                        "class": "count",
+                        "type": f"xstat-{xstat_name}",
+                    }
+                    names = {"port": port_id}
+                    log_sample(
+                        file_id, desc, names, {"end": ts, "value": xstat_value}
+                    )
+
+            link = port_data.get("/ethdev/link_status", {})
+            if link:
+                link_up = 1 if link.get("status") == "UP" else 0
+                desc = {
+                    "source": "dpdk",
+                    "class": "pass/fail",
+                    "type": "link-status",
+                }
+                names = {"port": port_id}
+                log_sample(file_id, desc, names, {"end": ts, "value": link_up})
+
+            info = port_data.get("/ethdev/info", {})
+            if info:
+                speed = info.get("speed")
+                if speed is not None and speed > 0:
+                    desc = {
+                        "source": "dpdk",
+                        "class": "count",
+                        "type": "link-speed-Mbps",
+                    }
+                    names = {"port": port_id}
+                    log_sample(
+                        file_id, desc, names, {"end": ts, "value": speed}
+                    )
+
+        for key, mp_data in data.items():
+            if not key.startswith("mempool_"):
+                continue
+            mp_name = key.replace("mempool_", "")
+            if isinstance(mp_data, dict):
+                for mp_field, cdm_type in [
+                    ("count", "mempool-used"),
+                    ("size", "mempool-total"),
+                ]:
+                    value = mp_data.get(mp_field)
+                    if value is not None:
+                        desc = {
+                            "source": "dpdk",
+                            "class": "count",
+                            "type": cdm_type,
+                        }
+                        names = {"mempool_name": mp_name}
+                        log_sample(
+                            file_id, desc, names, {"end": ts, "value": value}
+                        )
+
+    metric_files = finish_samples()
+
+    manifest = {
+        "rickshaw-bench-metric": {"schema": {"version": "2021.04.12"}},
+        "tool": "dpdk",
+        "primary-period": "measurement",
+        "primary-metric": "rx-packets",
+        "periods": [
+            {"name": "measurement", "metric-files": metric_files}
+        ],
+    }
+
+    manifest_path = os.path.join(output_dir, "post-process-data.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+if __name__ == "__main__":
+    output_dir = sys.argv[1] if len(sys.argv) >= 2 else "."
+    process(output_dir)
