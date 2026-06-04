@@ -11,7 +11,7 @@
 | **Phases** | 5 |
 | **Total Tasks** | 50 |
 | **External DPDK Deps** | 0 |
-| **Implementation Status** | Phase 1 complete, Phase 2 partial (post-process done, delta rates pending) |
+| **Implementation Status** | Phase 1 complete, Phase 2 complete (delta rates, direction breakout, device label, queue normalization) |
 | **Crucible Integration** | Registered and activated (`config/repos.json` + `subprojects/tools/dpdk`) |
 
 ---
@@ -121,7 +121,7 @@ The following requirements are derived from the real-time gaps identified above.
 | FR-09 | Support Grout-specific telemetry (graph-node stats, route state) via the Grout control-plane socket | **Could** (future) | Problem 6 | ⏳ Pending — Phase 5 |
 | FR-10 | Support application-specific telemetry endpoints (e.g., `/l3fwd_power/stats`) via extensible profiles | **Could** (future) | Extensibility | 🔶 Partial — profile loading implemented; only `default` profile exists |
 | FR-11 | Auto-discover DPDK telemetry sockets when `--file-prefix` is not explicitly provided | **Should** | Usability | ✅ Done — recursive globbing across 7 search directories + OVS file-prefix auto-detection via `ovs-vsctl` |
-| FR-12 | Compute per-second rates (deltas) from cumulative counters in post-processing | **Must** | All throughput metrics | ❌ Not done |
+| FR-12 | Compute per-second rates (deltas) from cumulative counters in post-processing | **Must** | All throughput metrics | ✅ Done — rx-pps, tx-pps, rx-Gbps, tx-Gbps, rx-missed-sec |
 
 #### Non-Functional Requirements
 
@@ -582,10 +582,10 @@ Parameters passed via crucible `tool-params`, arriving as CLI arguments to `dpdk
 | `--file-prefix` | (auto) | string | **Implemented** | DPDK `--file-prefix`; auto-scans multiple directories recursively if omitted (`/var/run/dpdk`, `/var/run/openvswitch`, `/var/run/openvswitch/.dpdk`, `/run/dpdk`, `/run/openvswitch`, `/run/openvswitch/.dpdk`, `/tmp/dpdk`, `$XDG_RUNTIME_DIR/dpdk`). Also auto-detects from OVS `other_config:dpdk-extra` via `ovs-vsctl` when available. |
 | `--socket-path` | (derived) | string | **Implemented** | Explicit path to `dpdk_telemetry.v2` socket |
 | `--profile` | `default` | string | **Implemented** | Application profile name (only `default` profile exists; includes `/ethdev/info` for link-speed) |
-| `--connect-timeout` | `180` | int | **Implemented** | Max seconds to wait for telemetry socket (increased from 30s to accommodate crucible timing where profiler starts ~120s before testpmd) |
+| `--connect-timeout` | `30` | int | **Implemented** | Seconds per retry cycle when searching for the telemetry socket. The collector retries indefinitely until stopped via SIGTERM, accommodating any gap between rickshaw's start-tools and server-start phases. |
 | `--endpoints` | (from profile) | string | *Planned* | Comma-separated additional endpoints to query |
 | `--hide-zero-xstats` | `true` | bool | *Hardcoded* | Hardcoded in `dpdk-collect`; not yet exposed as CLI parameter |
-| `--compute-rates` | `true` | bool | *Not implemented* | Per-second delta computation in post-processing |
+| `--compute-rates` | `true` | bool | **Implemented** | Per-second delta computation in post-processing (always on) |
 | `--reconnect-backoff` | `2` | int | *Hardcoded* | Hardcoded as `backoff=2` in `connect_with_retry()`; not yet exposed as CLI parameter |
 
 ---
@@ -694,8 +694,8 @@ Parameters passed via crucible `tool-params`, arriving as CLI arguments to `dpdk
 |-----|----------|-------------|----------|--------|
 | Socket cross-container access | **Critical** | DPDK telemetry socket created inside server engine container; tool-dpdk runs in separate profiler container | Shared `/var/run/dpdk` volume mount between server and profiler containers | 🔶 Design resolved — profiler co-located on server host in run file; volume mount config pending |
 | DPDK file-prefix discovery | **Critical** | testpmd uses `--file-prefix=$RS_CS_LABEL` which is an env var inside server container, not accessible to profiler | Auto-scan `/var/run/dpdk/**/dpdk_telemetry.v2` or pass `--file-prefix` as tool param | ✅ Resolved — recursive globbing across 7 search paths (dpdk, openvswitch, openvswitch/.dpdk, /run variants, /tmp, XDG) + OVS `ovs-vsctl` auto-detection + `--file-prefix` param + diagnostic logging on failure |
-| Socket readiness timing | **High** | `dpdk-start` runs before testpmd; socket doesn't exist yet | Poll with exponential backoff in dpdk-collect; `--connect-timeout` param (default 180s) | ✅ Resolved — `connect_with_retry()` with exponential backoff; 180s default accommodates crucible timing; graceful `TimeoutError` with diagnostic messages |
-| 16KB response truncation | Medium | Large xstats responses (100+ counters) may exceed 16,384 byte limit | Use `hide_zero=true`; if still truncated, split into subsets | ✅ Mitigated — `hide_zero=true` hardcoded in `dpdk-collect` |
+| Socket readiness timing | **High** | `dpdk-start` runs before testpmd; socket doesn't exist yet | Retry indefinitely in 30s cycles until SIGTERM from dpdk-stop | ✅ Resolved — collector retries until stopped; accommodates any gap between start-tools and server-start phases |
+| 16KB response truncation | Medium | Large xstats responses (100+ counters) may exceed 16,384 byte limit | Use negotiated `max_output_len` from handshake + `hide_zero=true` | ✅ Resolved — client uses negotiated buffer size; `hide_zero=true` hardcoded |
 | SOCK_SEQPACKET availability | Medium | Not all container runtimes expose this socket type | Python socket module handles it natively; fallback to SOCK_STREAM not needed for DPDK v2 | ✅ Resolved — works with `osruntime=chroot` |
 | Multiple DPDK processes | Low | Both TRex and testpmd create telemetry sockets; tool needs to target correct one | Support `--file-prefix` list or auto-filter by process name in `/info` response | 🔶 Partial — `--file-prefix` param supported; auto-filter not implemented |
 | Grout API protocol | Low (future) | Grout uses a custom control-plane socket separate from DPDK telemetry | Design pluggable client modules; implement Grout client in Phase 5 | ⏳ Pending — Phase 5 |
@@ -760,7 +760,7 @@ Build post-processing to convert collected JSON into CDM-compliant metrics. Firs
 | 2.2 | Map `ethdev/stats` fields to CDM `metric_desc` (source, class, type) with port/queue dimensions | ✅ Done — ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf + per-queue |
 | 2.3 | Map `ethdev/xstats` fields to CDM metrics with `hide_zero` filtering | ✅ Done — non-zero xstats emitted as `xstat-<name>` |
 | 2.4 | Map `mempool/info` fields to CDM metrics with `mempool_name` dimension | ✅ Done — mempool-used + mempool-total |
-| 2.5 | Implement delta computation for cumulative counters (per-second rates) | ❌ Not done — raw cumulative values logged; `--compute-rates` not implemented |
+| 2.5 | Implement delta computation for cumulative counters (per-second rates) | ✅ Done — rx-pps, tx-pps, rx-Gbps, tx-Gbps, rx-missed-sec with actual timestamp deltas |
 | 2.6 | Emit metrics via `toolbox.metrics.log_sample()` + `finish_samples()` | ✅ Done |
 | 2.7 | Write `post-process-data.json` output manifest | ✅ Done — schema version `2021.04.12` |
 | 2.8 | Implement socket auto-discovery: scan `/var/run/dpdk/*/dpdk_telemetry.v2` | ✅ Done — in `dpdk_telemetry_client.py` `discover_socket()` |

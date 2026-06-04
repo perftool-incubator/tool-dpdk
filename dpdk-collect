@@ -104,29 +104,38 @@ def collect(args):
     searched = client.list_searched_paths()
     sys.stderr.write(
         f"tool-dpdk: waiting for telemetry socket "
-        f"(timeout={args.connect_timeout}s)...\n"
+        f"(retry-interval={args.connect_timeout}s, retrying until stopped)...\n"
     )
     sys.stderr.write(
         f"tool-dpdk: searching directories: {searched}\n"
     )
 
-    try:
-        info = client.connect_with_retry(timeout=args.connect_timeout)
-    except TimeoutError as exc:
-        sys.stderr.write(f"tool-dpdk: {exc}\n")
+    info = None
+    while running:
+        try:
+            info = client.connect_with_retry(timeout=args.connect_timeout)
+            break
+        except TimeoutError:
+            if not running:
+                break
+            sys.stderr.write(
+                f"tool-dpdk: socket not found after {args.connect_timeout}s, "
+                f"retrying until stopped...\n"
+            )
+            sys.stderr.write(client.diagnose_paths() + "\n")
+
+    if info is None:
         sys.stderr.write(
-            "tool-dpdk: no DPDK telemetry socket available on this host. "
-            "Ensure the DPDK application (testpmd/OVS-DPDK) is running with "
-            "telemetry enabled and the socket path is accessible. "
-            "Use --socket-path to specify a non-standard location.\n"
+            "tool-dpdk: stopped before finding a telemetry socket. "
+            "If a DPDK application runs on this host, ensure telemetry "
+            "is enabled and the socket path is accessible.\n"
         )
-        sys.stderr.write("tool-dpdk: directory diagnostics:\n")
-        sys.stderr.write(client.diagnose_paths() + "\n")
         return
 
     sys.stderr.write(
         f"tool-dpdk: connected to {info.get('version', 'unknown')} "
-        f"(PID {info.get('pid', '?')})\n"
+        f"(PID {info.get('pid', '?')}) "
+        f"via {client.discovered_path}\n"
     )
 
     available = client.query("/")
@@ -148,6 +157,23 @@ def collect(args):
 
     eal_params = client.query("/eal/params")
 
+    port_info = {}
+    for port in ports:
+        resp = client.query(f"/ethdev/info,{port}")
+        pinfo = resp.get("/ethdev/info", {})
+        port_info[str(port)] = {
+            "name": pinfo.get("name", ""),
+            "driver": pinfo.get("driver_name", ""),
+            "mac_addr": pinfo.get("mac_addr", ""),
+            "mtu": pinfo.get("mtu", 0),
+            "nb_rx_queues": pinfo.get("nb_rx_queues", 0),
+            "nb_tx_queues": pinfo.get("nb_tx_queues", 0),
+        }
+        sys.stderr.write(
+            f"tool-dpdk: port {port}: {port_info[str(port)]['name']} "
+            f"({port_info[str(port)]['driver']})\n"
+        )
+
     output_file = os.path.join(args.output_dir, "dpdk-telemetry-output.json")
 
     with open(output_file, "w") as out:
@@ -156,6 +182,7 @@ def collect(args):
             "dpdk_version": info.get("version"),
             "dpdk_pid": info.get("pid"),
             "ports": ports,
+            "port_info": port_info,
             "mempools": mempools,
             "eal_params": eal_params,
             "profile": profile.get("name", args.profile),
@@ -196,13 +223,20 @@ def collect(args):
                     f"tool-dpdk: connection lost ({exc}), reconnecting...\n"
                 )
                 client.close()
-                try:
-                    client.connect_with_retry(timeout=args.connect_timeout)
-                    sys.stderr.write("tool-dpdk: reconnected\n")
-                except TimeoutError:
-                    sys.stderr.write(
-                        "tool-dpdk: reconnect failed, stopping\n"
-                    )
+                while running:
+                    try:
+                        client.connect_with_retry(
+                            timeout=args.connect_timeout
+                        )
+                        sys.stderr.write("tool-dpdk: reconnected\n")
+                        break
+                    except TimeoutError:
+                        if not running:
+                            break
+                        sys.stderr.write(
+                            "tool-dpdk: reconnect failed, retrying...\n"
+                        )
+                if not running or not client.connected:
                     break
 
             time.sleep(args.interval)
@@ -218,6 +252,9 @@ if __name__ == "__main__":
     parser.add_argument("--file-prefix", default=None)
     parser.add_argument("--socket-path", default=None)
     parser.add_argument("--profile", default="default")
-    parser.add_argument("--connect-timeout", type=int, default=180)
+    parser.add_argument("--connect-timeout", type=int, default=30,
+                        help="Seconds per retry cycle when searching for the "
+                             "telemetry socket. The collector retries "
+                             "indefinitely until stopped via SIGTERM.")
     parser.add_argument("--profiles-dir", default="profiles")
     collect(parser.parse_args())

@@ -12,8 +12,12 @@ DPDK Telemetry collection tool for the [perftool-incubator](https://github.com/p
 | CDM post-processing (all metrics to OpenSearch) | ✅ Complete |
 | Crucible/rickshaw integration (schema-compliant rickshaw.json, workshop.json) | ✅ Complete |
 | Multi-directory socket discovery (dpdk, openvswitch, /run, /tmp, XDG) | ✅ Complete |
-| Graceful timeout handling (180s default, diagnostic messages) | ✅ Complete |
-| Delta/rate computation for cumulative counters | ❌ Pending |
+| Indefinite socket retry (30s cycles until SIGTERM) | ✅ Complete |
+| Delta/rate computation (rx-pps, tx-pps, rx-Gbps, tx-Gbps, rx-missed-sec) | ✅ Complete |
+| Direction breakout (rx/tx normalization via CDM direction field) | ✅ Complete |
+| Per-queue xstat normalization (direction + queue labels) | ✅ Complete |
+| PCI address as device label | ✅ Complete |
+| Negotiated max_output_len from DPDK handshake | ✅ Complete |
 | Additional profiles (testpmd, l3fwd-power, grout) | ❌ Pending |
 
 ## Overview
@@ -49,16 +53,16 @@ crucible run bench-trafficgen \
 | `--file-prefix` | (auto) | DPDK `--file-prefix`; auto-scans multiple directories if omitted |
 | `--socket-path` | (derived) | Explicit path to `dpdk_telemetry.v2` socket |
 | `--profile` | `default` | Application profile name |
-| `--connect-timeout` | `180` | Max seconds to wait for telemetry socket (increased from 30s for crucible timing) |
+| `--connect-timeout` | `30` | Seconds per retry cycle when searching for the telemetry socket. The collector retries indefinitely until stopped via SIGTERM. |
 
 ## How It Works
 
 Rickshaw sets CWD to the tool output directory before invoking start/stop scripts. Parameters arrive as `--key value` arguments parsed with `getopt`.
 
 1. **dpdk-start** — Parses `--interval`, `--profile`, `--file-prefix`, `--socket-path`, `--connect-timeout` via `getopt`; launches `dpdk-collect` in the background; saves PID to `dpdk-collect-pid.txt`
-2. **dpdk-collect** — Searches multiple directories for the DPDK telemetry socket (with 180s retry + exponential backoff), discovers ports and mempools, polls endpoints at the configured interval, writes timestamped JSONL output. On timeout, exits gracefully with diagnostic messages instead of a traceback.
+2. **dpdk-collect** — Retries socket discovery indefinitely in 30s cycles until SIGTERM (accommodating the gap between rickshaw's `start-tools` and `server-start` phases). Discovers ports, mempools, and per-port metadata (PCI address, driver, MAC, queues). Polls endpoints at the configured interval, writes timestamped JSONL output. Uses negotiated `max_output_len` from the DPDK handshake. Logs the discovered socket path on connection.
 3. **dpdk-stop** — Reads PID, sends SIGTERM (10s grace, SIGKILL fallback), compresses output with `xz --threads=0`
-4. **dpdk-post-process** — Defaults to CWD when called without arguments (matching rickshaw convention). Resolves `TOOLBOX_HOME` for the metrics library, reads compressed JSONL, maps DPDK telemetry to CDM metrics via `toolbox.metrics.log_sample()` / `finish_samples()`, writes `post-process-data.json`
+4. **dpdk-post-process** — Defaults to CWD when called without arguments (matching rickshaw convention). Resolves `TOOLBOX_HOME` for the metrics library, reads compressed JSONL, computes delta rates (pps, Gbps, drops/sec) between consecutive samples, normalizes xstats with `direction` and `queue` labels, adds PCI address via `device` label, emits CDM metrics via `toolbox.metrics.log_sample()` / `finish_samples()`, writes `post-process-data.json`
 
 ## Socket Discovery
 
@@ -98,9 +102,22 @@ The dpdk profiler engine must be co-located on the **same host** where the DPDK 
 
 ### VM-Based Workloads
 
-When testpmd runs **inside a VM** (e.g., OVS-DPDK + VM-testpmd topology), the telemetry socket lives inside the VM's filesystem and is **not accessible** from the hypervisor host. In this scenario:
-- The dpdk tool on the hypervisor will gracefully time out with no data — this is expected
-- To collect testpmd telemetry from within the VM, the tool must be deployed inside the VM itself
+When testpmd runs **inside a VM** (e.g., OVS-DPDK + VM-testpmd topology), the telemetry socket is created inside the server engine container's filesystem. To make it visible to the profiler engine, add `host-mounts` to the server remote configuration in the run-file:
+
+```json
+{
+    "engines": [ { "role": "server", "ids": "2" } ],
+    "config": {
+        "settings": {
+            "osruntime": "chroot",
+            "host-mounts": [ { "src": "/run" } ]
+        },
+        "host": "192.168.0.103"
+    }
+}
+```
+
+This bind-mounts the host's `/run` into the server container, ensuring the testpmd socket at `/run/dpdk/<cs_label>/dpdk_telemetry.v2` is on the shared host filesystem where the profiler can find it.
 
 ### OVS-DPDK with Telemetry Disabled
 
@@ -140,23 +157,57 @@ Profiles define which telemetry endpoints to query. They live in the `profiles/`
 
 ## CDM Metrics Produced
 
+### Core Metrics (cumulative counters)
+
 | Telemetry Source | CDM Class | CDM Type | Dimensions |
 |------------------|-----------|----------|------------|
-| `ipackets` | throughput | rx-packets | port |
-| `opackets` | throughput | tx-packets | port |
-| `ibytes` | throughput | rx-bytes | port |
-| `obytes` | throughput | tx-bytes | port |
-| `imissed` | count | rx-missed | port |
-| `ierrors` | count | rx-errors | port |
-| `oerrors` | count | tx-errors | port |
-| `rx_nombuf` | count | rx-nombuf | port |
-| `q_ipackets[N]` | throughput | rx-queue-packets | port, queue |
-| `q_opackets[N]` | throughput | tx-queue-packets | port, queue |
-| xstats | count | xstat-\<name\> | port |
-| link_status | pass/fail | link-status | port |
-| link speed | count | link-speed-Mbps | port |
-| mempool count | count | mempool-used | mempool_name |
-| mempool size | count | mempool-total | mempool_name |
+| `ipackets` | throughput | rx-packets | port, device |
+| `opackets` | throughput | tx-packets | port, device |
+| `ibytes` | throughput | rx-bytes | port, device |
+| `obytes` | throughput | tx-bytes | port, device |
+| `imissed` | count | rx-missed | port, device |
+| `ierrors` | count | rx-errors | port, device |
+| `oerrors` | count | tx-errors | port, device |
+| `rx_nombuf` | count | rx-nombuf | port, device |
+
+### Rate Metrics (delta-computed per sample interval)
+
+| CDM Type | CDM Class | Unit | Dimensions |
+|----------|-----------|------|------------|
+| rx-pps | throughput | packets/sec | port, device |
+| tx-pps | throughput | packets/sec | port, device |
+| rx-Gbps | throughput | Gbps | port, device |
+| tx-Gbps | throughput | Gbps | port, device |
+| rx-missed-sec | throughput | drops/sec | port, device |
+
+### Per-Queue Metrics
+
+| CDM Type | Dimensions | Description |
+|----------|------------|-------------|
+| queue-q{N}-packets | port, device, direction | Per-queue packet counter from ethdev/stats |
+| xstat-q\_packets | port, device, direction, queue | Normalized per-queue xstat packets |
+| xstat-q\_bytes | port, device, direction, queue | Normalized per-queue xstat bytes |
+| xstat-q\_good\_packets | port, device, direction, queue | Per-queue valid packets (virtio) |
+
+### xstats (direction-normalized)
+
+| CDM Type | Dimensions | Description |
+|----------|------------|-------------|
+| xstat-good\_packets | port, device, direction | Valid packets |
+| xstat-phy\_packets | port, device, direction | PHY-layer packets (Intel) |
+| xstat-unicast\_packets | port, device, direction | Unicast packets |
+| xstat-size\_64\_packets | port, device, direction | 64B packet count |
+| xstat-missed\_errors | port, device, direction | NIC ring overflow |
+| xstat-mac\_local\_errors | port, device | No direction (MAC-level) |
+
+### Other Metrics
+
+| CDM Type | CDM Class | Dimensions |
+|----------|-----------|------------|
+| link-status | pass/fail | port, device |
+| link-speed-Mbps | count | port, device |
+| mempool-used | count | mempool\_name |
+| mempool-total | count | mempool\_name |
 
 ## Dependencies
 
@@ -194,13 +245,15 @@ crucible update dpdk
     { "tool": "sysstat" },
     { "tool": "procstat" },
     { "tool": "dpdk", "params": [
-        { "arg": "interval", "val": "1" },
-        { "arg": "profile", "val": "default" }
+        { "arg": "interval", "val": "1" }
     ]}
 ]
 ```
 
-**Important:** The profiler must be co-located on the same host as the DUT server (testpmd) so tool-dpdk can access the telemetry socket at `/var/run/dpdk/`.
+**Notes:**
+- The profiler is auto-deployed to all hosts. No explicit `--socket-path` or `--connect-timeout` needed.
+- For VM testpmd hosts, add `"host-mounts": [{"src": "/run"}]` to the server remote settings.
+- The collector retries socket discovery indefinitely until the DPDK application starts.
 
 ## Running Tests
 
