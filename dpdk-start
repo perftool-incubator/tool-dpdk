@@ -1,0 +1,76 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+TOOL_DIR=$(dirname "$0")
+TOOL_OUTPUT_DIR=$(pwd)
+
+INTERVAL=1
+FILE_PREFIX=""
+SOCKET_PATH=""
+PROFILE="default"
+CONNECT_TIMEOUT=180
+
+longopts="interval:,file-prefix:,socket-path:,profile:,connect-timeout:"
+opts=$(getopt -q -o "" --longoptions "$longopts" -n "getopt.sh" -- "$@");
+if [ $? -ne 0 ]; then
+    printf -- "\tUnrecognized option specified\n\n"
+    exit 1
+fi
+eval set -- "$opts";
+while true; do
+    case "$1" in
+        --interval)
+            shift;
+            INTERVAL="$1"
+            shift
+            ;;
+        --file-prefix)
+            shift;
+            FILE_PREFIX="$1"
+            shift
+            ;;
+        --socket-path)
+            shift;
+            SOCKET_PATH="$1"
+            shift
+            ;;
+        --profile)
+            shift;
+            PROFILE="$1"
+            shift
+            ;;
+        --connect-timeout)
+            shift;
+            CONNECT_TIMEOUT="$1"
+            shift
+            ;;
+        --)
+            shift;
+            break
+            ;;
+        *)
+            echo "Invalid option: $1"
+            exit 1
+    esac
+done
+
+CMD="python3 ${TOOL_DIR}/dpdk-collect"
+CMD+=" --output-dir ${TOOL_OUTPUT_DIR}"
+CMD+=" --interval ${INTERVAL}"
+CMD+=" --profile ${PROFILE}"
+CMD+=" --connect-timeout ${CONNECT_TIMEOUT}"
+CMD+=" --profiles-dir ${TOOL_DIR}/profiles"
+
+if [ -n "${FILE_PREFIX}" ]; then
+    CMD+=" --file-prefix ${FILE_PREFIX}"
+fi
+if [ -n "${SOCKET_PATH}" ]; then
+    CMD+=" --socket-path ${SOCKET_PATH}"
+fi
+
+${CMD} &
+COLLECTOR_PID=$!
+echo "${COLLECTOR_PID}" > "${TOOL_OUTPUT_DIR}/dpdk-collect-pid.txt"
+
+echo "tool-dpdk: collector started (PID ${COLLECTOR_PID}), interval=${INTERVAL}s, profile=${PROFILE}"

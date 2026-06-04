@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+tool-dpdk collector: polls DPDK telemetry endpoints at a configurable
+interval and writes timestamped JSON output.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dpdk_telemetry_client import DPDKTelemetryClient  # noqa: E402
+
+running = True
+
+
+def detect_ovs_file_prefix():
+    """Attempt to determine the DPDK file-prefix from OVS configuration.
+
+    OVS-DPDK stores EAL arguments in other_config:dpdk-extra. If a
+    --file-prefix is set there, return it so the socket can be found
+    under the matching subdirectory.
+    """
+    if not shutil.which("ovs-vsctl"):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["ovs-vsctl", "get", "Open_vSwitch", ".", "other_config:dpdk-extra"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return None
+        dpdk_extra = result.stdout.strip().strip('"')
+        if "--no-telemetry" in dpdk_extra:
+            sys.stderr.write(
+                "tool-dpdk: WARNING: OVS configured with --no-telemetry, "
+                "telemetry socket will not be available\n"
+            )
+            return None
+        parts = dpdk_extra.split()
+        for i, part in enumerate(parts):
+            if part == "--file-prefix" and i + 1 < len(parts):
+                return parts[i + 1]
+            if part.startswith("--file-prefix="):
+                return part.split("=", 1)[1]
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def handle_signal(signum, frame):
+    global running
+    running = False
+
+
+def load_profile(profiles_dir, profile_name):
+    """Load an endpoint profile from the profiles directory."""
+    path = os.path.join(profiles_dir, f"{profile_name}.json")
+    if not os.path.exists(path):
+        path = os.path.join(profiles_dir, "default.json")
+
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+
+    return {
+        "name": "default",
+        "endpoints_per_port": [
+            "/ethdev/stats",
+            "/ethdev/xstats",
+            "/ethdev/link_status",
+        ],
+        "endpoints_global": ["/mempool/list"],
+        "mempool_info": True,
+    }
+
+
+def collect(args):
+    global running
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    profile = load_profile(args.profiles_dir, args.profile)
+
+    file_prefix = args.file_prefix
+    if not file_prefix and not args.socket_path:
+        detected = detect_ovs_file_prefix()
+        if detected:
+            sys.stderr.write(
+                f"tool-dpdk: auto-detected OVS file-prefix: {detected}\n"
+            )
+            file_prefix = detected
+
+    client = DPDKTelemetryClient(
+        socket_path=args.socket_path, file_prefix=file_prefix
+    )
+
+    searched = client.list_searched_paths()
+    sys.stderr.write(
+        f"tool-dpdk: waiting for telemetry socket "
+        f"(timeout={args.connect_timeout}s)...\n"
+    )
+    sys.stderr.write(
+        f"tool-dpdk: searching directories: {searched}\n"
+    )
+
+    try:
+        info = client.connect_with_retry(timeout=args.connect_timeout)
+    except TimeoutError as exc:
+        sys.stderr.write(f"tool-dpdk: {exc}\n")
+        sys.stderr.write(
+            "tool-dpdk: no DPDK telemetry socket available on this host. "
+            "Ensure the DPDK application (testpmd/OVS-DPDK) is running with "
+            "telemetry enabled and the socket path is accessible. "
+            "Use --socket-path to specify a non-standard location.\n"
+        )
+        sys.stderr.write("tool-dpdk: directory diagnostics:\n")
+        sys.stderr.write(client.diagnose_paths() + "\n")
+        return
+
+    sys.stderr.write(
+        f"tool-dpdk: connected to {info.get('version', 'unknown')} "
+        f"(PID {info.get('pid', '?')})\n"
+    )
+
+    available = client.query("/")
+    sys.stderr.write(
+        f"tool-dpdk: {len(available.get('/', []))} commands available\n"
+    )
+
+    port_list = client.query("/ethdev/list")
+    ports = port_list.get("/ethdev/list", [])
+    sys.stderr.write(f"tool-dpdk: found {len(ports)} port(s): {ports}\n")
+
+    mempools = []
+    if profile.get("mempool_info"):
+        mp_list = client.query("/mempool/list")
+        mempools = mp_list.get("/mempool/list", [])
+        sys.stderr.write(
+            f"tool-dpdk: found {len(mempools)} mempool(s): {mempools}\n"
+        )
+
+    eal_params = client.query("/eal/params")
+
+    output_file = os.path.join(args.output_dir, "dpdk-telemetry-output.json")
+
+    with open(output_file, "w") as out:
+        header = {
+            "tool": "dpdk",
+            "dpdk_version": info.get("version"),
+            "dpdk_pid": info.get("pid"),
+            "ports": ports,
+            "mempools": mempools,
+            "eal_params": eal_params,
+            "profile": profile.get("name", args.profile),
+            "interval": args.interval,
+        }
+        out.write(json.dumps({"header": header}) + "\n")
+
+        while running:
+            timestamp_ms = int(time.time() * 1000)
+            sample = {"timestamp_ms": timestamp_ms, "data": {}}
+
+            try:
+                for port in ports:
+                    port_data = {}
+                    for endpoint in profile.get("endpoints_per_port", []):
+                        cmd = f"{endpoint},{port}"
+                        if "xstats" in endpoint:
+                            cmd += ",hide_zero=true"
+                        resp = client.query(cmd)
+                        port_data[endpoint] = resp.get(endpoint, resp)
+                    sample["data"][f"port_{port}"] = port_data
+
+                for mp in mempools:
+                    resp = client.query(f"/mempool/info,{mp}")
+                    sample["data"][f"mempool_{mp}"] = resp.get(
+                        "/mempool/info", resp
+                    )
+
+                for endpoint in profile.get("endpoints_global", []):
+                    resp = client.query(endpoint)
+                    sample["data"][endpoint] = resp.get(endpoint, resp)
+
+                out.write(json.dumps(sample) + "\n")
+                out.flush()
+
+            except (ConnectionError, BrokenPipeError, OSError) as exc:
+                sys.stderr.write(
+                    f"tool-dpdk: connection lost ({exc}), reconnecting...\n"
+                )
+                client.close()
+                try:
+                    client.connect_with_retry(timeout=args.connect_timeout)
+                    sys.stderr.write("tool-dpdk: reconnected\n")
+                except TimeoutError:
+                    sys.stderr.write(
+                        "tool-dpdk: reconnect failed, stopping\n"
+                    )
+                    break
+
+            time.sleep(args.interval)
+
+    client.close()
+    sys.stderr.write("tool-dpdk: collection stopped\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DPDK telemetry collector")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--interval", type=int, default=1)
+    parser.add_argument("--file-prefix", default=None)
+    parser.add_argument("--socket-path", default=None)
+    parser.add_argument("--profile", default="default")
+    parser.add_argument("--connect-timeout", type=int, default=180)
+    parser.add_argument("--profiles-dir", default="profiles")
+    collect(parser.parse_args())

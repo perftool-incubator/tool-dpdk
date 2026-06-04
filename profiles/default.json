@@ -1,0 +1,14 @@
+{
+    "name": "default",
+    "description": "Standard DPDK library-level telemetry endpoints for testpmd/OVS-DPDK",
+    "endpoints_per_port": [
+        "/ethdev/stats",
+        "/ethdev/xstats",
+        "/ethdev/link_status",
+        "/ethdev/info"
+    ],
+    "endpoints_global": [
+        "/mempool/list"
+    ],
+    "mempool_info": true
+}
