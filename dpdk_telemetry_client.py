@@ -36,6 +36,8 @@ class DPDKTelemetryClient:
         self._file_prefix = file_prefix
         self._sock = None
         self._info = None
+        self._max_output = MAX_OUTPUT_LEN
+        self._connected_path = None
 
     @property
     def info(self):
@@ -45,6 +47,11 @@ class DPDKTelemetryClient:
     @property
     def connected(self):
         return self._sock is not None
+
+    @property
+    def discovered_path(self):
+        """The socket path used for the current connection."""
+        return self._connected_path
 
     def _find_sockets_in_dir(self, base_dir):
         """Recursively find telemetry sockets under a directory."""
@@ -151,6 +158,8 @@ class DPDKTelemetryClient:
 
         self._sock = sock
         self._info = json.loads(raw.decode("utf-8"))
+        self._max_output = self._info.get("max_output_len", MAX_OUTPUT_LEN)
+        self._connected_path = path
         return self._info
 
     def query(self, command):
@@ -159,7 +168,7 @@ class DPDKTelemetryClient:
             raise ConnectionError("Not connected. Call connect() first.")
 
         self._sock.send(command.encode("utf-8"))
-        raw = self._sock.recv(MAX_OUTPUT_LEN)
+        raw = self._sock.recv(self._max_output)
         return json.loads(raw.decode("utf-8"))
 
     def close(self):
@@ -171,6 +180,8 @@ class DPDKTelemetryClient:
                 pass
             self._sock = None
             self._info = None
+            self._max_output = MAX_OUTPUT_LEN
+            self._connected_path = None
 
     def connect_with_retry(self, timeout=30, backoff=2):
         """

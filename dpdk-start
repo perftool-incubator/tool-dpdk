@@ -9,7 +9,7 @@ INTERVAL=1
 FILE_PREFIX=""
 SOCKET_PATH=""
 PROFILE="default"
-CONNECT_TIMEOUT=180
+CONNECT_TIMEOUT=30
 
 longopts="interval:,file-prefix:,socket-path:,profile:,connect-timeout:"
 opts=$(getopt -q -o "" --longoptions "$longopts" -n "getopt.sh" -- "$@");

@@ -9,6 +9,7 @@ and emits CDM-compliant metrics via the toolbox.metrics API.
 import json
 import lzma
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,65 @@ if TOOLBOX_HOME:
     sys.path.append(str(Path(TOOLBOX_HOME) / "python"))
 
 from toolbox.metrics import log_sample, finish_samples
+
+
+CUMULATIVE_STATS = [
+    ("ipackets", "throughput", "rx-packets"),
+    ("opackets", "throughput", "tx-packets"),
+    ("ibytes", "throughput", "rx-bytes"),
+    ("obytes", "throughput", "tx-bytes"),
+    ("imissed", "count", "rx-missed"),
+    ("ierrors", "count", "rx-errors"),
+    ("oerrors", "count", "tx-errors"),
+    ("rx_nombuf", "count", "rx-nombuf"),
+]
+
+RATE_STATS = [
+    ("ipackets", "throughput", "rx-pps"),
+    ("opackets", "throughput", "tx-pps"),
+    ("ibytes", "throughput", "rx-Gbps"),
+    ("obytes", "throughput", "tx-Gbps"),
+    ("imissed", "throughput", "rx-missed-sec"),
+]
+
+XSTAT_DIRECTION_RE = re.compile(r"^(rx|tx)_(.+)$")
+XSTAT_QUEUE_RE = re.compile(r"^q(\d+)_(.+)$")
+
+
+def compute_rate(metric_name, delta_value, delta_sec):
+    """Convert a counter delta to the appropriate rate unit."""
+    if delta_sec <= 0:
+        return None
+    if metric_name in ("ibytes", "obytes"):
+        return (delta_value * 8) / (delta_sec * 1e9)
+    return delta_value / delta_sec
+
+
+def build_names(port_id, port_info):
+    """Build CDM names dict from port metadata.
+
+    Uses the existing CDM 'device' field (keyword) to store the PCI
+    address with colons replaced by dots to avoid CDM label parsing
+    issues (0000:4b:00.0 becomes 0000.4b.00.0).
+    """
+    names = {"port": port_id}
+    info = port_info.get(port_id, {})
+    if info.get("name"):
+        names["device"] = info["name"].replace(":", ".")
+    return names
+
+
+def split_direction(xstat_name):
+    """Split rx_/tx_ prefix from an xstat name into (direction, suffix).
+
+    Returns (direction, suffix) if the name starts with rx_ or tx_,
+    otherwise returns (None, None). Names like 'mac_local_errors' that
+    have no direction are not split.
+    """
+    m = XSTAT_DIRECTION_RE.match(xstat_name)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
 
 
 def process(output_dir):
@@ -32,9 +92,11 @@ def process(output_dir):
         return
 
     header = json.loads(lines[0]).get("header", {})
+    port_info = header.get("port_info", {})
     samples = [json.loads(line) for line in lines[1:] if line.strip()]
 
     file_id = "0"
+    prev = {}
 
     for sample in samples:
         ts = sample.get("timestamp_ms")
@@ -44,18 +106,11 @@ def process(output_dir):
             if not key.startswith("port_"):
                 continue
             port_id = key.replace("port_", "")
+            names = build_names(port_id, port_info)
 
-            stats = port_data.get("/ethdev/stats", {})
-            for metric_name, cdm_class, cdm_type in [
-                ("ipackets", "throughput", "rx-packets"),
-                ("opackets", "throughput", "tx-packets"),
-                ("ibytes", "throughput", "rx-bytes"),
-                ("obytes", "throughput", "tx-bytes"),
-                ("imissed", "count", "rx-missed"),
-                ("ierrors", "count", "rx-errors"),
-                ("oerrors", "count", "tx-errors"),
-                ("rx_nombuf", "count", "rx-nombuf"),
-            ]:
+            stats = port_data.get("/ethdev/stats") or {}
+
+            for metric_name, cdm_class, cdm_type in CUMULATIVE_STATS:
                 value = stats.get(metric_name)
                 if value is not None:
                     desc = {
@@ -63,40 +118,97 @@ def process(output_dir):
                         "class": cdm_class,
                         "type": cdm_type,
                     }
-                    names = {"port": port_id}
                     log_sample(file_id, desc, names, {"end": ts, "value": value})
 
-            for q_metric, cdm_type in [
-                ("q_ipackets", "rx-queue-packets"),
-                ("q_opackets", "tx-queue-packets"),
+            prev_key = f"port_{port_id}"
+            if prev_key in prev:
+                prev_ts = prev[prev_key]["ts"]
+                prev_stats = prev[prev_key]["stats"]
+                delta_sec = (ts - prev_ts) / 1000.0
+                for metric_name, cdm_class, cdm_type in RATE_STATS:
+                    cur_val = stats.get(metric_name)
+                    prev_val = prev_stats.get(metric_name)
+                    if cur_val is not None and prev_val is not None:
+                        delta = cur_val - prev_val
+                        if delta < 0:
+                            continue
+                        rate = compute_rate(metric_name, delta, delta_sec)
+                        if rate is not None:
+                            desc = {
+                                "source": "dpdk",
+                                "class": cdm_class,
+                                "type": cdm_type,
+                            }
+                            log_sample(file_id, desc, names, {
+                                "begin": prev_ts,
+                                "end": ts,
+                                "value": rate,
+                            })
+
+            prev[prev_key] = {"ts": ts, "stats": dict(stats)}
+
+            for q_metric, q_direction in [
+                ("q_ipackets", "rx"),
+                ("q_opackets", "tx"),
             ]:
                 q_values = stats.get(q_metric, [])
                 for queue_id, value in enumerate(q_values):
                     if value and value != 0:
+                        dir_names = dict(names)
+                        dir_names["direction"] = q_direction
                         desc = {
                             "source": "dpdk",
                             "class": "throughput",
-                            "type": cdm_type,
+                            "type": f"queue-q{queue_id}-packets",
                         }
-                        names = {"port": port_id, "queue": str(queue_id)}
                         log_sample(
-                            file_id, desc, names, {"end": ts, "value": value}
+                            file_id, desc, dir_names,
+                            {"end": ts, "value": value},
                         )
 
-            xstats = port_data.get("/ethdev/xstats", {})
+            xstats = port_data.get("/ethdev/xstats") or {}
             for xstat_name, xstat_value in xstats.items():
-                if isinstance(xstat_value, (int, float)) and xstat_value != 0:
+                if not isinstance(xstat_value, (int, float)) or xstat_value == 0:
+                    continue
+
+                direction, suffix = split_direction(xstat_name)
+                if direction and suffix:
+                    dir_names = dict(names)
+                    dir_names["direction"] = direction
+
+                    qm = XSTAT_QUEUE_RE.match(suffix)
+                    if qm:
+                        queue_id, metric_suffix = qm.groups()
+                        dir_names["queue"] = queue_id
+                        desc = {
+                            "source": "dpdk",
+                            "class": "count",
+                            "type": f"xstat-q_{metric_suffix}",
+                        }
+                    else:
+                        desc = {
+                            "source": "dpdk",
+                            "class": "count",
+                            "type": f"xstat-{suffix}",
+                        }
+
+                    log_sample(
+                        file_id, desc, dir_names,
+                        {"end": ts, "value": xstat_value},
+                    )
+                else:
                     desc = {
                         "source": "dpdk",
                         "class": "count",
                         "type": f"xstat-{xstat_name}",
                     }
-                    names = {"port": port_id}
                     log_sample(
-                        file_id, desc, names, {"end": ts, "value": xstat_value}
+                        file_id, desc, names,
+                        {"end": ts, "value": xstat_value},
                     )
 
-            link = port_data.get("/ethdev/link_status", {})
+
+            link = port_data.get("/ethdev/link_status") or {}
             if link:
                 link_up = 1 if link.get("status") == "UP" else 0
                 desc = {
@@ -104,19 +216,17 @@ def process(output_dir):
                     "class": "pass/fail",
                     "type": "link-status",
                 }
-                names = {"port": port_id}
                 log_sample(file_id, desc, names, {"end": ts, "value": link_up})
 
-            info = port_data.get("/ethdev/info", {})
-            if info:
-                speed = info.get("speed")
+            info_data = port_data.get("/ethdev/info") or {}
+            if info_data:
+                speed = info_data.get("speed")
                 if speed is not None and speed > 0:
                     desc = {
                         "source": "dpdk",
                         "class": "count",
                         "type": "link-speed-Mbps",
                     }
-                    names = {"port": port_id}
                     log_sample(
                         file_id, desc, names, {"end": ts, "value": speed}
                     )
@@ -137,9 +247,10 @@ def process(output_dir):
                             "class": "count",
                             "type": cdm_type,
                         }
-                        names = {"mempool_name": mp_name}
+                        mp_names = {"mempool_name": mp_name}
                         log_sample(
-                            file_id, desc, names, {"end": ts, "value": value}
+                            file_id, desc, mp_names,
+                            {"end": ts, "value": value},
                         )
 
     metric_files = finish_samples()
@@ -148,7 +259,7 @@ def process(output_dir):
         "rickshaw-bench-metric": {"schema": {"version": "2021.04.12"}},
         "tool": "dpdk",
         "primary-period": "measurement",
-        "primary-metric": "rx-packets",
+        "primary-metric": "rx-pps",
         "periods": [
             {"name": "measurement", "metric-files": metric_files}
         ],
