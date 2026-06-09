@@ -271,5 +271,5 @@ def process(output_dir):
 
 
 if __name__ == "__main__":
-    output_dir = sys.argv[1] if len(sys.argv) >= 2 else "."
+    output_dir = sys.argv[1] if len(sys.argv) >= 2 else "postprocess"
     process(output_dir)
