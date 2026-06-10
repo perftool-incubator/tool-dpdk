@@ -79,8 +79,26 @@ def split_direction(xstat_name):
     return None, None
 
 
-def process(output_dir):
-    compressed = os.path.join(output_dir, "dpdk-telemetry-output.json.xz")
+def get_tool_source_name(input_dir):
+    """Get the tool instance name to use as metric source.
+
+    Reads tool_name from engine-env.txt (e.g., 'dpdk-ovs',
+    'dpdk-testpmd'). Falls back to 'dpdk' if not found.
+    """
+    env_file = os.path.join(input_dir, "engine-env.txt")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    if line.startswith("tool_name="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    return "dpdk"
+
+
+def process(output_dir, input_dir="."):
+    compressed = os.path.join(input_dir, "dpdk-telemetry-output.json.xz")
     if not os.path.exists(compressed):
         sys.stderr.write(f"tool-dpdk: {compressed} not found, skipping\n")
         return
@@ -95,6 +113,7 @@ def process(output_dir):
     port_info = header.get("port_info", {})
     samples = [json.loads(line) for line in lines[1:] if line.strip()]
 
+    source_name = get_tool_source_name(input_dir)
     file_id = "0"
     prev = {}
 
@@ -114,7 +133,7 @@ def process(output_dir):
                 value = stats.get(metric_name)
                 if value is not None:
                     desc = {
-                        "source": "dpdk",
+                        "source": source_name,
                         "class": cdm_class,
                         "type": cdm_type,
                     }
@@ -135,7 +154,7 @@ def process(output_dir):
                         rate = compute_rate(metric_name, delta, delta_sec)
                         if rate is not None:
                             desc = {
-                                "source": "dpdk",
+                                "source": source_name,
                                 "class": cdm_class,
                                 "type": cdm_type,
                             }
@@ -156,10 +175,11 @@ def process(output_dir):
                     if value and value != 0:
                         dir_names = dict(names)
                         dir_names["direction"] = q_direction
+                        dir_names["queue"] = str(queue_id)
                         desc = {
-                            "source": "dpdk",
+                            "source": source_name,
                             "class": "throughput",
-                            "type": f"queue-q{queue_id}-packets",
+                            "type": "queue-packets",
                         }
                         log_sample(
                             file_id, desc, dir_names,
@@ -181,13 +201,13 @@ def process(output_dir):
                         queue_id, metric_suffix = qm.groups()
                         dir_names["queue"] = queue_id
                         desc = {
-                            "source": "dpdk",
+                            "source": source_name,
                             "class": "count",
                             "type": f"xstat-q_{metric_suffix}",
                         }
                     else:
                         desc = {
-                            "source": "dpdk",
+                            "source": source_name,
                             "class": "count",
                             "type": f"xstat-{suffix}",
                         }
@@ -198,7 +218,7 @@ def process(output_dir):
                     )
                 else:
                     desc = {
-                        "source": "dpdk",
+                        "source": source_name,
                         "class": "count",
                         "type": f"xstat-{xstat_name}",
                     }
@@ -212,7 +232,7 @@ def process(output_dir):
             if link:
                 link_up = 1 if link.get("status") == "UP" else 0
                 desc = {
-                    "source": "dpdk",
+                    "source": source_name,
                     "class": "pass/fail",
                     "type": "link-status",
                 }
@@ -223,7 +243,7 @@ def process(output_dir):
                 speed = info_data.get("speed")
                 if speed is not None and speed > 0:
                     desc = {
-                        "source": "dpdk",
+                        "source": source_name,
                         "class": "count",
                         "type": "link-speed-Mbps",
                     }
@@ -243,7 +263,7 @@ def process(output_dir):
                     value = mp_data.get(mp_field)
                     if value is not None:
                         desc = {
-                            "source": "dpdk",
+                            "source": source_name,
                             "class": "count",
                             "type": cdm_type,
                         }

@@ -18,6 +18,7 @@ DPDK Telemetry collection tool for the [perftool-incubator](https://github.com/p
 | Per-queue xstat normalization (direction + queue labels) | ✅ Complete |
 | PCI address as device label | ✅ Complete |
 | Negotiated max_output_len from DPDK handshake | ✅ Complete |
+| Multi-instance support (id, opt-in deployment, per-instance CDM source) | ✅ Complete |
 | Additional profiles (testpmd, l3fwd-power, grout) | ❌ Pending |
 
 ## Overview
@@ -62,7 +63,7 @@ Rickshaw sets CWD to the tool output directory before invoking start/stop script
 1. **dpdk-start** — Parses `--interval`, `--profile`, `--file-prefix`, `--socket-path`, `--connect-timeout` via `getopt`; launches `dpdk-collect` in the background; saves PID to `dpdk-collect-pid.txt`
 2. **dpdk-collect** — Retries socket discovery indefinitely in 30s cycles until SIGTERM (accommodating the gap between rickshaw's `start-tools` and `server-start` phases). Discovers ports, mempools, and per-port metadata (PCI address, driver, MAC, queues). Polls endpoints at the configured interval, writes timestamped JSONL output. Uses negotiated `max_output_len` from the DPDK handshake. Logs the discovered socket path on connection.
 3. **dpdk-stop** — Reads PID, sends SIGTERM (10s grace, SIGKILL fallback), compresses output with `xz --threads=0`
-4. **dpdk-post-process** — Defaults to CWD when called without arguments (matching rickshaw convention). Resolves `TOOLBOX_HOME` for the metrics library, reads compressed JSONL, computes delta rates (pps, Gbps, drops/sec) between consecutive samples, normalizes xstats with `direction` and `queue` labels, adds PCI address via `device` label, emits CDM metrics via `toolbox.metrics.log_sample()` / `finish_samples()`, writes `post-process-data.json`
+4. **dpdk-post-process** — Reads input files (`dpdk-telemetry-output.json.xz`, `engine-env.txt`) from the tool directory and writes output (`post-process-data.json`, `metric-data-*`) to `postprocess/` (PERFNFV-316 layout). Resolves `TOOLBOX_HOME` for the metrics library, reads compressed JSONL, computes delta rates (pps, Gbps, drops/sec) between consecutive samples, normalizes xstats with `direction` and `queue` labels, adds PCI address via `device` label, reads `engine-env.txt` for per-instance CDM source naming, emits CDM metrics via `toolbox.metrics.log_sample()` / `finish_samples()`
 
 ## Socket Discovery
 
@@ -184,7 +185,7 @@ Profiles define which telemetry endpoints to query. They live in the `profiles/`
 
 | CDM Type | Dimensions | Description |
 |----------|------------|-------------|
-| queue-q{N}-packets | port, device, direction | Per-queue packet counter from ethdev/stats |
+| queue-packets | port, device, direction, queue | Per-queue packet counter from ethdev/stats |
 | xstat-q\_packets | port, device, direction, queue | Normalized per-queue xstat packets |
 | xstat-q\_bytes | port, device, direction, queue | Normalized per-queue xstat bytes |
 | xstat-q\_good\_packets | port, device, direction, queue | Per-queue valid packets (virtio) |
@@ -255,10 +256,66 @@ crucible update dpdk
 - For VM testpmd hosts, add `"host-mounts": [{"src": "/run"}]` to the server remote settings.
 - The collector retries socket discovery indefinitely until the DPDK application starts.
 
+### Multi-Instance (recommended for OVS + testpmd topologies)
+
+When monitoring both OVS-DPDK on the compute host and testpmd on a separate server host, use separate tool instances with `opt-in` deployment to target each DPDK application on its correct host:
+
+```json
+"tool-params": [
+    { "tool": "sysstat" },
+    { "tool": "procstat" },
+    {
+        "tool": "dpdk",
+        "id": "dpdk-ovs",
+        "deployment": "opt-in",
+        "opt-tag": "has-ovs",
+        "params": [
+            { "arg": "interval", "val": "1" }
+        ]
+    },
+    {
+        "tool": "dpdk",
+        "id": "dpdk-testpmd",
+        "deployment": "opt-in",
+        "opt-tag": "has-testpmd",
+        "params": [
+            { "arg": "interval", "val": "1" },
+            { "arg": "socket-path", "val": "/var/run/dpdk" }
+        ]
+    }
+]
+```
+
+With matching endpoint tags to control which host each instance deploys to:
+
+```json
+"endpoints": [{
+    "type": "remotehosts",
+    "config": [
+        {
+            "host": "compute-host.example.com",
+            "settings": { "tool-opt-in-tags": "has-ovs" }
+        },
+        {
+            "host": "server-host.example.com",
+            "settings": { "tool-opt-in-tags": "has-testpmd" }
+        }
+    ]
+}]
+```
+
+**How multi-instance works:**
+
+- Rickshaw creates separate output directories for each instance (`tool-data/dpdk-ovs/`, `tool-data/dpdk-testpmd/`).
+- Each instance's start/stop scripts run independently in their own directory.
+- CDM metrics use per-instance source names (e.g., `dpdk-ovs`, `dpdk-testpmd`) read from `engine-env.txt`, so results are distinguishable in OpenSearch.
+- The `id` field must start with the tool name prefix (`dpdk-`).
+- Query per-instance metrics with: `crucible get metric --run <id> --source dpdk-ovs --type rx-pps`
+
 ## Running Tests
 
 ```bash
-python3 -m pytest tests/test_telemetry_client.py -v
+python3 -m unittest discover -s tests -v
 ```
 
 ## License
