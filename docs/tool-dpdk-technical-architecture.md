@@ -122,6 +122,7 @@ The following requirements are derived from the real-time gaps identified above.
 | FR-10 | Support application-specific telemetry endpoints (e.g., `/l3fwd_power/stats`) via extensible profiles | **Could** (future) | Extensibility | 🔶 Partial — profile loading implemented; only `default` profile exists |
 | FR-11 | Auto-discover DPDK telemetry sockets when `--file-prefix` is not explicitly provided | **Should** | Usability | ✅ Done — recursive globbing across 7 search directories + OVS file-prefix auto-detection via `ovs-vsctl` |
 | FR-12 | Compute per-second rates (deltas) from cumulative counters in post-processing | **Must** | All throughput metrics | ✅ Done — rx-pps, tx-pps, rx-Gbps, tx-Gbps, rx-missed-sec |
+| FR-13 | Support multi-instance deployment with per-instance CDM source naming via `id`, `deployment`, and `opt-tag` run file fields | **Should** | Multi-host topologies (OVS + testpmd) | ✅ Done — `get_tool_source_name()` reads `engine-env.txt`; regression tests in `tests/test_post_process.py` |
 
 #### Non-Functional Requirements
 
@@ -196,7 +197,7 @@ To illustrate the practical impact, here is a concrete before/after comparison w
 | FR-09 | Grout dual-socket collection | `grout-telemetry-client.py`, `dpdk-collect` | 5.1–5.7 | ⏳ Pending |
 | FR-10 | Extensible profiles | `profiles/`, `dpdk-collect` | 4.1–4.5 | 🔶 Partial — infrastructure done, only `default` profile |
 | FR-11 | Socket auto-discovery | `dpdk_telemetry_client.py` (recursive glob + `diagnose_paths()`), `dpdk-collect` (OVS auto-detection via `ovs-vsctl`) | 2.8 | ✅ Done |
-| FR-12 | Delta computation | `dpdk-post-process` | 2.5 | ❌ Not done |
+| FR-12 | Delta computation | `dpdk-post-process` | 2.5 | ✅ Done |
 | NFR-01 | Non-intrusive polling | 1s default interval, separate telemetry thread | 3.8 | ✅ Design met |
 | NFR-02 | CDM compliance | `dpdk-post-process` via `toolbox.metrics` | 2.6, 2.7 | ✅ Done |
 | NFR-03 | Zero DPDK deps | Raw `SOCK_SEQPACKET` via Python stdlib | 1.4 | ✅ Done |
@@ -204,6 +205,7 @@ To illustrate the practical impact, here is a concrete before/after comparison w
 | NFR-05 | All endpoint types | `rickshaw.json` whitelist + volume mounts | 3.1–3.4 | 🔶 Partial — whitelist configured; volume mounts pending |
 | NFR-06 | xz compression | `dpdk-stop` | 1.7 | ✅ Done |
 | NFR-07 | Profile extensibility | `profiles/` directory + `--profile` param | 4.1–4.2 | ✅ Done |
+| FR-13 | Multi-instance source naming | `dpdk-post-process` (`get_tool_source_name()`) | 3.11–3.13 | ✅ Done |
 
 ---
 
@@ -268,13 +270,14 @@ tool-dpdk operates within the crucible benchmarking ecosystem. The following dia
     ┌─────────────────────────────────────────────────────────────────────────────┐
     │  POST-PROCESSING (on controller)                                            │
     │                                                                             │
-    │  dpdk-post-process                                                          │
-    │    ├── read dpdk-telemetry-output.json.xz                                   │
+    │  dpdk-post-process (input_dir=., output_dir=postprocess/)                   │
+    │    ├── read ./engine-env.txt → source_name (e.g. "dpdk-ovs")               │
+    │    ├── read ./dpdk-telemetry-output.json.xz                                 │
     │    ├── parse timestamped JSON samples                                       │
     │    ├── compute deltas (per-second rates)                                    │
     │    ├── toolbox.metrics.log_sample() for each metric                         │
     │    ├── toolbox.metrics.finish_samples()                                     │
-    │    └── output: post-process-data.json + metric-data-*.json.xz               │
+    │    └── output: postprocess/{post-process-data.json, metric-data-*}          │
     │                         │                                                   │
     │                         ▼                                                   │
     │              CDM indexing into OpenSearch                                   │
@@ -351,23 +354,25 @@ In a bench-trafficgen run, testpmd acts as the DUT server. It is launched by `tr
  POST-       ┌──────────────────────────────────────────────────────────────┴───┐
  PROCESS     │  dpdk-post-process (on controller)                               │
  (ctrl)      │                                                                  │
-             │  1. decompress dpdk-telemetry-output.json.xz                     │
-             │  2. for each DATE-delimited sample:                              │
-             │       parse JSON responses                                       │
-             │       for each port, each metric:                                │
-             │         desc = {source:"dpdk", class:"throughput", type:"..."}   │
-             │         names = {port:"0", queue:"2", ...}                       │
-             │         sample = {end: epoch_ms, value: N}                       │
-             │         toolbox.metrics.log_sample(fid, desc, names, sample)     │
-             │  3. (future) compute deltas when --compute-rates is implemented  │
-             │  4. toolbox.metrics.finish_samples()                             │
-             │  5. write post-process-data.json                                 │
+             │  Input (from tool dir root):                                     │
+             │    dpdk-telemetry-output.json.xz                                 │
+             │    engine-env.txt (tool_name for CDM source)                     │
              │                                                                  │
-             │  Output files:                                                   │
-             │    post-process-data.json                                        │
-             │    metric-data-0.json.xz  (ethdev stats)                         │
-             │    metric-data-1.json.xz  (ethdev xstats)                        │
-             │    metric-data-2.json.xz  (mempool metrics)                      │
+             │  1. read engine-env.txt → source_name (e.g. "dpdk-ovs")         │
+             │  2. decompress dpdk-telemetry-output.json.xz                     │
+             │  3. for each timestamped sample:                                 │
+             │       for each port, each metric:                                │
+             │         desc = {source: source_name, class:..., type:...}        │
+             │         names = {port:"0", device:"0000.4b.00.0", ...}           │
+             │         toolbox.metrics.log_sample(fid, desc, names, sample)     │
+             │  4. compute delta rates (rx-pps, tx-pps, rx-Gbps, tx-Gbps)      │
+             │  5. toolbox.metrics.finish_samples()                             │
+             │  6. write post-process-data.json                                 │
+             │                                                                  │
+             │  Output (to postprocess/ subdir — PERFNFV-316):                  │
+             │    postprocess/post-process-data.json                            │
+             │    postprocess/metric-data-0.csv.xz                              │
+             │    postprocess/metric-data-0.json.xz                             │
              └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -532,7 +537,7 @@ The DPDK Telemetry library (`librte_telemetry`) runs a dedicated listener thread
 | `dpdk-start` | Bash | Parse CLI args, discover socket, launch dpdk-collect in background, save PID |
 | `dpdk-collect` | Python | Main collection loop: auto-detect OVS file-prefix, connect to DPDK telemetry socket, poll endpoints, write timestamped JSON; emits directory diagnostics on failure |
 | `dpdk-stop` | Bash | Read PID, send SIGTERM, wait for exit, xz compress all output files |
-| `dpdk-post-process` | Python | Read compressed JSON, compute deltas, emit CDM metrics via toolbox.metrics API |
+| `dpdk-post-process` | Python | Read compressed JSON from tool dir root (input\_dir), compute deltas, emit CDM metrics via toolbox.metrics API to postprocess/ (output\_dir); reads `engine-env.txt` for per-instance source naming |
 | `dpdk_telemetry_client.py` | Python | Reusable client library: SOCK_SEQPACKET connection, handshake, query, reconnect, recursive multi-directory socket discovery, path diagnostics |
 | `profiles/` | JSON | Application profiles defining endpoint sets per DPDK app type |
 | `README.md` | Markdown | Usage guide, parameter reference, profile documentation |
@@ -553,6 +558,8 @@ Profiles define which telemetry endpoints to query for each DPDK application typ
 
 Each DPDK telemetry value maps to a CDM metric document with source, class, type, and dimensional names. Post-processing computes per-second deltas for cumulative counters.
 
+> **Source naming:** In single-instance mode, all metrics use source `dpdk`. In multi-instance mode (run file `id` field), the source matches the tool-id (e.g., `dpdk-ovs`, `dpdk-testpmd`), read from `engine-env.txt` written by rickshaw. This allows per-instance metric queries: `crucible get metric --run <id> --source dpdk-ovs --type rx-pps`.
+
 | Telemetry Source | CDM Class | CDM Type | Dimensions | Implemented | Delta? |
 |------------------|-----------|----------|------------|-------------|--------|
 | `/ethdev/stats` → `ipackets` | throughput | rx-packets | port | **Yes** | No (cumulative; delta planned) |
@@ -563,8 +570,8 @@ Each DPDK telemetry value maps to a CDM metric document with source, class, type
 | `/ethdev/stats` → `ierrors` | count | rx-errors | port | **Yes** | No (cumulative; delta planned) |
 | `/ethdev/stats` → `oerrors` | count | tx-errors | port | **Yes** | No (cumulative; delta planned) |
 | `/ethdev/stats` → `rx_nombuf` | count | rx-nombuf | port | **Yes** | No (cumulative; delta planned) |
-| `/ethdev/stats` → `q_ipackets[N]` | throughput | rx-queue-packets | port, queue | **Yes** | No (cumulative; delta planned) |
-| `/ethdev/stats` → `q_opackets[N]` | throughput | tx-queue-packets | port, queue | **Yes** | No (cumulative; delta planned) |
+| `/ethdev/stats` → `q_ipackets[N]` | throughput | queue-packets | port, device, direction (rx), queue | **Yes** | No (cumulative; delta planned) |
+| `/ethdev/stats` → `q_opackets[N]` | throughput | queue-packets | port, device, direction (tx), queue | **Yes** | No (cumulative; delta planned) |
 | `/ethdev/xstats` → `<name>` | count | xstat-\<name\> | port | **Yes** | No (cumulative; delta planned) |
 | `/ethdev/link_status` → `status` | pass/fail | link-status | port | **Yes** | No (point-in-time) |
 | `/ethdev/info` → `speed` | count | link-speed-Mbps | port | **Yes** | No (point-in-time) |
@@ -587,6 +594,8 @@ Parameters passed via crucible `tool-params`, arriving as CLI arguments to `dpdk
 | `--hide-zero-xstats` | `true` | bool | *Hardcoded* | Hardcoded in `dpdk-collect`; not yet exposed as CLI parameter |
 | `--compute-rates` | `true` | bool | **Implemented** | Per-second delta computation in post-processing (always on) |
 | `--reconnect-backoff` | `2` | int | *Hardcoded* | Hardcoded as `backoff=2` in `connect_with_retry()`; not yet exposed as CLI parameter |
+
+> **Multi-instance identity** is not a CLI parameter. When the same tool appears multiple times in `tool-params` with different `id` values, rickshaw creates separate working directories and writes `engine-env.txt` with `tool_name=<tool-id>`. The post-processor reads this file to set the CDM metric source name. No script changes are needed for multi-instance — isolation is directory-based, consistent with the rickshaw tool lifecycle.
 
 ---
 
@@ -624,14 +633,20 @@ Parameters passed via crucible `tool-params`, arriving as CLI arguments to `dpdk
     files to controller
 
 10. Post-process on controller     ──▶    11. Execute dpdk-post-process
+                                              • Input from tool dir root (.):
+                                                engine-env.txt, dpdk-telemetry-output.json.xz
+                                              • Read engine-env.txt for tool instance name
+                                                (e.g., dpdk-ovs, dpdk-testpmd; defaults to dpdk)
                                               • Read dpdk-telemetry-output.json.xz
                                               • Parse timestamped JSON samples
                                               • Compute deltas (per-second rates)
                                               • toolbox.metrics.log_sample() per metric
+                                                (source = tool instance name)
                                               • toolbox.metrics.finish_samples()
-                                              • Write post-process-data.json
+                                              • Output to postprocess/ subdir:
+                                                post-process-data.json, metric-data-*.{csv,json}.xz
 
-12. CDM indexing                   ◀──     metric-data-*.json.xz indexed to OpenSearch
+12. CDM indexing                   ◀──     postprocess/metric-data-*.json.xz indexed to OpenSearch
 ```
 
 ### 7.2 rickshaw.json Manifest
@@ -748,11 +763,11 @@ Deliver a working collector that can connect to a standalone dpdk-testpmd instan
 | 1.9 | Manual test: run standalone testpmd, verify tool-dpdk collects JSON output | ✅ Done |
 | 1.10 | Write `README.md` with basic usage and parameter reference | ✅ Done |
 
-### Phase 2 — CDM Integration (Weeks 4–6) 🔶 Partial
+### Phase 2 — CDM Integration (Weeks 4–6) ✅ Done
 
 Build post-processing to convert collected JSON into CDM-compliant metrics. First crucible integration test.
 
-**Status:** Post-processing implemented for ethdev stats, per-queue stats, xstats, link_status, and mempool metrics. Socket auto-discovery implemented. Delta/rate computation (Task 2.5) NOT yet implemented — raw cumulative values are logged. Crucible integration (Task 2.9) complete — tool registered, run file validated, profiler placement verified.
+**Status:** Post-processing implemented for ethdev stats, per-queue stats, xstats, link_status, and mempool metrics. Socket auto-discovery implemented. Delta/rate computation implemented (rx-pps, tx-pps, rx-Gbps, tx-Gbps, rx-missed-sec). Crucible integration complete — tool registered, run file validated, profiler placement verified. Post-processing output now goes to `postprocess/` subdirectory (PERFNFV-316), with input/output path separation (`process(output_dir, input_dir=".")`).
 
 | Task | Description | Status |
 |------|-------------|--------|
@@ -785,6 +800,9 @@ Handle real-world deployment: volume mounts, endpoint types, multi-process scena
 | 3.8 | Performance test: verify tool-dpdk polling does not impact testpmd forwarding rate | ⏳ Pending |
 | 3.9 | Write deployment guide for each endpoint type (remotehosts, k8s, OSP) | ⏳ Pending |
 | 3.10 | Update bench-trafficgen documentation to reference tool-dpdk | ⏳ Pending |
+| 3.11 | Implement `get_tool_source_name()` in `dpdk-post-process` reading `engine-env.txt` for per-instance CDM source naming | ✅ Done |
+| 3.12 | Add regression tests for multi-instance source naming (`tests/test_post_process.py`) | ✅ Done |
+| 3.13 | Document multi-instance run file pattern in README.md (id, deployment, opt-tag, endpoint tags) | ✅ Done |
 
 ### Phase 4 — Extensibility (Weeks 10–12) ⏳ Not started
 
@@ -1552,8 +1570,26 @@ import sys
 from toolbox.metrics import log_sample, finish_samples
 
 
-def process(output_dir):
-    compressed = os.path.join(output_dir, "dpdk-telemetry-output.json.xz")
+def get_tool_source_name(input_dir):
+    """Get the tool instance name to use as metric source.
+
+    Reads tool_name from engine-env.txt (e.g., 'dpdk-ovs',
+    'dpdk-testpmd'). Falls back to 'dpdk' if not found.
+    """
+    env_file = os.path.join(input_dir, "engine-env.txt")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    if line.startswith("tool_name="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    return "dpdk"
+
+
+def process(output_dir, input_dir="."):
+    compressed = os.path.join(input_dir, "dpdk-telemetry-output.json.xz")
     if not os.path.exists(compressed):
         sys.stderr.write(f"tool-dpdk: {compressed} not found, skipping\n")
         return
@@ -1568,6 +1604,7 @@ def process(output_dir):
     header = json.loads(lines[0]).get("header", {})
     samples = [json.loads(line) for line in lines[1:] if line.strip()]
 
+    source_name = get_tool_source_name(input_dir)
     prev_sample = None
     file_id = "0"
 
@@ -1595,7 +1632,7 @@ def process(output_dir):
                 value = stats.get(metric_name)
                 if value is not None:
                     desc = {
-                        "source": "dpdk",
+                        "source": source_name,
                         "class": cdm_class,
                         "type": cdm_type,
                     }
@@ -1606,24 +1643,23 @@ def process(output_dir):
                     )
 
             # Per-queue stats
-            for q_metric, cdm_type in [
-                ("q_ipackets", "rx-queue-packets"),
-                ("q_opackets", "tx-queue-packets"),
+            for q_metric, q_direction in [
+                ("q_ipackets", "rx"),
+                ("q_opackets", "tx"),
             ]:
                 q_values = stats.get(q_metric, [])
                 for queue_id, value in enumerate(q_values):
                     if value and value != 0:
+                        dir_names = dict(names)
+                        dir_names["direction"] = q_direction
+                        dir_names["queue"] = str(queue_id)
                         desc = {
-                            "source": "dpdk",
+                            "source": source_name,
                             "class": "throughput",
-                            "type": cdm_type,
-                        }
-                        names = {
-                            "port": port_id,
-                            "queue": str(queue_id),
+                            "type": "queue-packets",
                         }
                         log_sample(
-                            file_id, desc, names,
+                            file_id, desc, dir_names,
                             {"end": ts, "value": value}
                         )
 
@@ -1653,10 +1689,8 @@ def process(output_dir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.stderr.write("Usage: dpdk-post-process <output-dir>\n")
-        sys.exit(1)
-    process(sys.argv[1])
+    output_dir = sys.argv[1] if len(sys.argv) >= 2 else "postprocess"
+    process(output_dir)
 ```
 
 #### A.4.8 `profiles/default.json`
