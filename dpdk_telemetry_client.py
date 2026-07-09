@@ -83,7 +83,6 @@ class DPDKTelemetryClient:
                 path = os.path.join(base, self._file_prefix, DPDK_TELEMETRY_V2)
                 if os.path.exists(path):
                     return path
-            return None
 
         xdg = os.environ.get("XDG_RUNTIME_DIR")
         search_dirs = list(SEARCH_DIRS)

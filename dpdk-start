@@ -5,6 +5,9 @@
 TOOL_DIR=$(dirname "$0")
 TOOL_OUTPUT_DIR=$(pwd)
 
+exec > "${TOOL_OUTPUT_DIR}/dpdk-start-stderrout.txt"
+exec 2>&1
+
 INTERVAL=1
 FILE_PREFIX=""
 SOCKET_PATH=""

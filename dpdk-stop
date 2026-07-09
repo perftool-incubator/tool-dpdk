@@ -4,6 +4,9 @@
 
 TOOL_OUTPUT_DIR=$(pwd)
 
+exec > "${TOOL_OUTPUT_DIR}/dpdk-stop-stderrout.txt"
+exec 2>&1
+
 PID_FILE="${TOOL_OUTPUT_DIR}/dpdk-collect-pid.txt"
 
 if [ -f "${PID_FILE}" ]; then
