@@ -1,0 +1,41 @@
+{
+  "rickshaw-tool-metadata": {
+    "schema": {
+      "version": "2026.08.11"
+    }
+  },
+  "tool": "dpdk",
+  "description": "DPDK port, queue, and mempool statistics via dpdk-telemetry v2 UNIX socket. Computes delta rates (pps, Gbps), normalized xstats, link state/speed, and per-queue metrics.",
+  "cdm_indexed": true,
+  "cdm_sources": [
+    {
+      "source": "dpdk",
+      "types": [
+        "rx-packets",
+        "tx-packets",
+        "rx-bytes",
+        "tx-bytes",
+        "rx-missed",
+        "rx-errors",
+        "tx-errors",
+        "rx-nombuf",
+        "rx-pps",
+        "tx-pps",
+        "rx-Gbps",
+        "tx-Gbps",
+        "rx-missed-sec",
+        "queue-packets",
+        "link-status",
+        "link-speed-Mbps",
+        "mempool-used",
+        "mempool-total",
+        "xstat-<counter-name>"
+      ]
+    }
+  ],
+  "output_files": [
+    "dpdk-telemetry-output.json.xz",
+    "dpdk-start-stderrout.txt",
+    "dpdk-stop-stderrout.txt"
+  ]
+}
