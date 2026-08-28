@@ -9,7 +9,7 @@
   "cdm_indexed": true,
   "cdm_sources": [
     {
-      "source": "dpdk",
+      "source": "dpdk-<instance>",
       "types": [
         "rx-packets",
         "tx-packets",

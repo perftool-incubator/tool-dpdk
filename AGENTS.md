@@ -70,6 +70,15 @@ The collector retries socket discovery **indefinitely** (in 30s cycles) until SI
 - On hosts with no DPDK application (e.g., TRex), the tool retries until stopped, then exits cleanly with no error
 - The `--connect-timeout` parameter (default 30s) controls the per-cycle retry interval, not a total timeout
 
+## Testing
+
+- Run post-processor locally: `cd <tool-data-dir> && TOOLBOX_HOME=/opt/crucible/subprojects/core/toolbox python3 /opt/crucible/subprojects/tools/dpdk/dpdk-post-process`
+- Validate syntax: `python3 -c "import py_compile; py_compile.compile('dpdk-post-process', doraise=True)"`
+- Run test suite: `TOOLBOX_HOME=/opt/crucible/subprojects/core/toolbox python3 -m unittest discover -s tests/ -v`
+- Validate tool-metadata: `python3 -c "import json, jsonschema; s = json.load(open('/opt/crucible/schema/tool-metadata.json')); m = json.load(open('tool-metadata.json')); jsonschema.validate(instance=m, schema=s)"`
+- Validate multiplex: `python3 -c "import json, jsonschema; s = json.load(open('/opt/crucible/subprojects/core/multiplex/JSON/req-schema.json')); m = json.load(open('multiplex.json')); jsonschema.validate(instance=m, schema=s)"`
+- Full integration: `crucible run <run-file.json>` with dpdk configured
+
 ## Conventions
 - Primary branch is `main`
 - Standard Bash modelines and 4-space indentation
