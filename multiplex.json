@@ -1,0 +1,31 @@
+{
+    "presets": {
+        "defaults" : [
+            { "arg": "interval", "vals": ["1"] },
+            { "arg": "profile", "vals": ["default"] },
+            { "arg": "connect-timeout", "vals": ["30"] }
+        ]
+    },
+    "validations": {
+        "positive_integer" : {
+            "description" : "a whole number greater than 0",
+            "args" : [ "interval", "connect-timeout" ],
+            "vals": "^[1-9][0-9]*$"
+        },
+        "profile_name" : {
+            "description" : "telemetry profile name matching a profile JSON file in profiles/",
+            "args" : [ "profile" ],
+            "vals": "^[A-Za-z0-9_.-]+$"
+        },
+        "file_prefix" : {
+            "description" : "DPDK runtime file prefix (e.g. rte, ovs)",
+            "args" : [ "file-prefix" ],
+            "vals": "^[A-Za-z0-9_.-]+$"
+        },
+        "socket_path" : {
+            "description" : "path to DPDK telemetry v2 UNIX domain socket",
+            "args" : [ "socket-path" ],
+            "vals": "^/[A-Za-z0-9_./-]+$"
+        }
+    }
+}
